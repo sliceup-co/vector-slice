@@ -1,3 +1,6 @@
+use std::env;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use crate::{
     buffers::Acker,
     event::{self, Event, Value},
@@ -77,6 +80,10 @@ pub struct KafkaSink {
     seq_head: usize,
     seq_tail: usize,
     pending_acks: HashSet<usize>,
+
+    host_atom: Atom,
+    key_topic: bool,
+    number_keys: u64,
 }
 
 inventory::submit! {
@@ -124,6 +131,21 @@ impl KafkaSinkConfig {
 impl KafkaSink {
     fn new(config: KafkaSinkConfig, acker: Acker) -> crate::Result<Self> {
         let producer = config.to_rdkafka()?.create().context(KafkaCreateFailed)?;
+
+        let key_topic_env = match env::var("KEY_TOPIC") {
+            Ok(val) => val.to_lowercase().eq("true"),
+            Err(_e) => false,
+        };
+
+        let number_keys_env = match env::var("NUMBER_KEYS") {
+            Ok(val) => val.parse::<u64>().unwrap(),
+            Err(_e) => 0,
+        };
+        if key_topic_env{
+            assert!(number_keys_env != 0);
+        }
+        info!("Starting Kafka Sink with key_topic: {} and number_keys: {}", key_topic_env, number_keys_env);
+
         Ok(KafkaSink {
             producer,
             topic: Template::try_from(config.topic).context(TopicTemplate)?,
@@ -134,7 +156,26 @@ impl KafkaSink {
             seq_head: 0,
             seq_tail: 0,
             pending_acks: HashSet::new(),
+            host_atom: Atom::from("host"),
+            key_topic: key_topic_env,
+            number_keys: number_keys_env,
         })
+    }
+
+    fn get_hash(&mut self, host: &String) -> u64{
+        return self.hash_string(host) % self.number_keys;
+    }
+
+    fn hash_string(&mut self, host: &String) -> u64{
+        let mut s = DefaultHasher::new();
+        host.hash(&mut s);
+        return s.finish();
+    }
+
+    fn modify_topic(&mut self, topic: &mut String, item: &Event){
+        let host: String = item.as_log().get(&self.host_atom).unwrap().to_string_lossy();
+        let key_host = format!("-{}", self.get_hash(&host));
+        topic.push_str(&key_host);
     }
 }
 
@@ -143,9 +184,14 @@ impl Sink for KafkaSink {
     type SinkError = ();
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        let topic = self.topic.render_string(&item).map_err(|missing_keys| {
+        let mut topic = self.topic.render_string(&item).map_err(|missing_keys| {
             error!(message = "Missing keys for topic", ?missing_keys);
         })?;
+        //let keys = item.as_log().keys();
+        if self.key_topic{
+            self.modify_topic(&mut topic, &item);
+            //info!("{}", topic);
+        }
 
         let (key, body) = encode_event(item.clone(), &self.key_field, &self.encoding);
 
